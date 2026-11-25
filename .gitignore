@@ -2,3 +2,5 @@ config/logs/
 config/*.log
 .env
 *.bak
+__pycache__/
+*.pyc

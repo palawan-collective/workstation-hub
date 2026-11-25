@@ -1,41 +1,29 @@
 # MerQato Workstation — Operations
 
-Canonical URL: **https://home.merqato.digital** (password prompt)
-Secondary: `https://work.merqato.digital` (Cloudflare Access SSO / email OTP)
-`dash.merqato.digital` 301-redirects to `home.`
+Canonical URL: **https://work.merqato.digital** (single Basic Auth login)
+`home.merqato.digital` and `dash.merqato.digital` 301-redirect to `work.merqato.digital`.
+There is only one dashboard; the legacy Homepage on port 3003 is stopped.
 
 ## Access control
 
-Two entry points with different dashboard surfaces:
+One entry point: `https://work.merqato.digital`. Caddy no longer has `basic_auth`;
+the app handles login in `app/admin.py` with PBKDF2 password hashes and a signed
+session. The first admin (`david@merqato.digital`) is seeded from
+`WS_ADMIN_USER` / `WS_ADMIN_PASSWORD` in `/opt/homepage/.env`. Cloudflare Access
+was deleted. Do not recreate the Access app, re-enable the legacy Homepage, or
+add a second host/UI.
 
-| Host | Surface | Auth | Use it when |
-| --- | --- | --- | --- |
-| `home.merqato.digital` | Workstation app | Caddy `basic_auth` (browser prompt) | daily use — one prompt, then cached for the session |
-| `work.merqato.digital` | legacy Homepage fallback | Cloudflare Access, app `MerQato Workstation` | you want SSO / one-time PIN instead of a password |
+Settings → Account changes your own password; Settings → Users & roles adds,
+reassigns and removes accounts with `admin`, `operator` or `viewer` roles.
+Settings → Agent engine selects OpenRouter (free-tier models only, synced from
+`/api/v1/models`) or Ollama (models synced from the configured machine's
+`/api/tags`); Refresh models bypasses the 10-minute cache. The Agents view has
+a live test chat. No model runs until the agent is enabled and a model chosen.
 
-Credentials for `home` live in `/opt/homepage/auth.txt` (chmod 600):
-
-```
-user: david
-bcrypt hash: <stored in /opt/homepage/auth.txt>
-```
-
-The password prompt covers the whole origin, so Workstation and hub XHRs are
-authenticated by the same cached browser credentials — no "API Error" tiles.
-
-### Cloudflare Access details (work host)
-
-| Item | Value |
-| --- | --- |
-| Team domain | `wild-fire-a01f.cloudflareaccess.com` |
-| Application | `MerQato Workstation` |
-| Destination | `work.merqato.digital` |
-| Policy | `Owners` — Allow, Include → Emails |
-| Allowed emails | david@merqato.digital, david@palawancollective.com, growpalawan@gmail.com |
-| Login method | Cloudflare SSO + email one-time PIN |
-
-If Access ever feels slow, use `home` — it never touches Cloudflare's edge
-login flow.
+Rotate the password in two places when the permanent scheme is decided:
+Workstation (Settings → Account) and the `WS_ADMIN_PASSWORD` seed value in
+`/opt/homepage/.env`. Uptime Kuma and both `status.` hostnames were retired on
+21 Nov 2026 — Workstation is now the single status page.
 
 ## Services (docker compose, /opt/homepage/docker-compose.yml)
 
@@ -50,17 +38,13 @@ login flow.
 `social-caddy-1` (in `/opt/social`) terminates TLS and routes:
 
 ```
-home.merqato.digital   (basic_auth)
+work.merqato.digital   (Caddy basic_auth; Cloudflare passes through)
   /files/*  -> host.docker.internal:3004
   /hub/*    -> host.docker.internal:3010
   *         -> host.docker.internal:3005
 
-work.merqato.digital   (Cloudflare Access at the edge)
-  /files/*  -> host.docker.internal:3004
-  /hub/*    -> host.docker.internal:3010
-  *         -> host.docker.internal:3003
-
-dash.merqato.digital -> 301 https://home.merqato.digital{uri}
+home.merqato.digital -> 301 https://work.merqato.digital{uri}
+dash.merqato.digital -> 301 https://work.merqato.digital{uri}
 ```
 
 The Caddyfile is bind-mounted from `/opt/social/Caddyfile`. Edit it in place
@@ -101,11 +85,11 @@ secret is ever returned; the Cloudflare and Coolify tokens live only in
 | --- | --- | --- |
 | Cloudflare | REST API, DNS-scoped token | `/opt/homepage/.env` → `CF_API_TOKEN` |
 | Docker | read-only socket proxy (`CONTAINERS`,`INFO`,`VERSION` only) | none |
-| Uptime Kuma | Homepage `uptimekuma` widget, public status page `/status/merqato` | none |
-| GitHub | REST API, 3 accounts; token adds private-repo and inventory access | `GITHUB_TOKEN` when private inventory access is required |
+| Site scan | cron → `app/scan.py` reads `/hub/domains.json`, writes `data/scans.json` | none |
+| GitHub | REST API, `palawan-collective` org; token adds private-repo and inventory access | `GITHUB_TOKEN` when private inventory access is required |
 | Vercel | REST API, latest 20 deployments | `/opt/homepage/.env` → `VERCEL_TOKEN` |
 | Resend | REST API, latest 20 delivery records | `/opt/homepage/.env` → `RESEND_API_KEY` |
-| Project inventory | `inventory.json` in the `merqatodigital/projects` GitHub repository | `GITHUB_TOKEN` |
+| Project inventory | `inventory.json` in the `palawan-collective/projects` GitHub repository (repo not yet recreated) | `GITHUB_TOKEN` |
 | Coolify | REST API v1, read-only PAT | `COOLIFY_TOKEN` (token file `/opt/homepage/.coolify-token`) |
 | UpCloud | instance metadata `169.254.169.254` + `/proc`, written by cron | none |
 
@@ -113,12 +97,20 @@ Coolify token abilities are `["read"]`; a `POST /api/v1/projects` returns 403.
 The token is scoped to team `0` (Root Team), which is where the projects and
 servers live — teams 1 and 2 are empty.
 
+`COOLIFY_URL` must point at the local API, not the public hostname:
+`http://host.docker.internal:8000`. `coolify.merqato.digital` sits behind
+Cloudflare Access, so any request from the hub gets the Access sign-in HTML
+instead of JSON (this is what put a 69 KB HTML page in the Coolify tile). Both
+`hubapi` and `workstation` carry an `extra_hosts: host.docker.internal:host-gateway`
+entry for this. `hub.py`'s `clean_text()` now rejects HTML/oversized values, so a
+repeat shows as `ok: false` with an error instead of raw markup on the dashboard.
+
 The hub alert webhook requires `ALERT_KEY` and fails closed when the key is
 missing or incorrect. Keep `ALERT_KEY` in `/opt/homepage/.env` and never in the
-repository. Configure the Uptime Kuma webhook URL as
-`https://home.merqato.digital/hub/alert` and add the custom request header
-`X-Hub-Key` with the same value as `ALERT_KEY`. A missing or incorrect header
-returns 403 before the request body is read.
+repository. Any sender must use the `/hub/alert` endpoint with a custom
+`X-Hub-Key` header matching `ALERT_KEY`; a missing or incorrect header returns
+403 before the request body is read. With Uptime Kuma retired there is no
+configured sender today.
 
 ## Exposure boundary
 
@@ -138,20 +130,26 @@ service, `/proc/meminfo`, `/proc/loadavg` and `df`. No API key required.
 ## Known failing endpoints
 
 `Site Health` probes every public hostname in the Cloudflare zone (20s timeout,
-follows redirects). As of 20 Nov 2026, **17 up / 6 failing**:
+follows redirects). As of 21 Nov 2026, **19 up / 0 failing — ALL CLEAR**.
 
-| Host | Classification | Symptom |
-| --- | --- | --- |
-| `command.merqato.digital` | active origin issue | 502 — Caddy routes to port 3100, where no listener/container exists |
-| `www.palawancollective.com` | active origin issue | Cloudflare 526 — origin TLS validation fails; the apex works |
-| `sanvic.palawancollective.com` | obsolete alias | obsolete unproxied alias; origin TLS fails; canonical `sanvic.merqato.digital` works |
-| `www.sanvic.palawancollective.com` | obsolete alias | obsolete unproxied alias; origin TLS fails |
-| `susi.merqato.digital` | obsolete alias | obsolete unproxied host with no valid TLS route |
-| `www.status.merqato.digital` | obsolete alias | obsolete alias with no Caddy route; canonical `status.merqato.digital` works |
+Fixed on 21 Nov 2026:
+- `www.palawancollective.com` — Cloudflare Single Redirect rule sends `www.*`
+  to the apex, where the site works. No Vercel account changes.
+- `susi.merqato.digital` — SUSIBooks restored from the private
+  `palawan-collective/palawan-books` repo (`bir-compliance` branch) at
+  `/opt/susibooks`. The GHCR images were unavailable to the deployment token,
+  so both images were built locally under a 4 GB memory cap. The repo's HEAD has
+  a JSX syntax error in `app/(dashboard)/payroll/employees/page.tsx` (two root
+  elements in one return); a local fragment wrapper was added to build it. No
+  GitHub changes were pushed. Fresh Postgres + MinIO volumes mean **no old
+  accounting data was restored** — create a new account/sign in at
+  `https://susi.merqato.digital/sign-up`.
 
-The two active origin issues require owner approval before DNS, Caddy, or service
-changes. The four obsolete aliases should be retired separately; deleting them
-is not part of a Workstation release.
+Retired on 21 Nov 2026, with their Cloudflare DNS records deleted and Caddy
+routes removed: both `status.merqato.digital` hostnames (plus the Uptime Kuma
+stack), `command.merqato.digital` (freed for later use), and both
+`sanvic.palawancollective.com` hostnames (freed for later use). No GitHub or
+Vercel accounts were touched.
 
 A response at or above 80% of the 20s timeout is reported as *slow* rather than
 *down*. These are monitored HTTPS endpoints, not DNS-only health checks.
@@ -176,7 +174,11 @@ Root access remains with the owner's key `~/.ssh/merqato_vps`.
 
 ## Rollback
 
-Every change is snapshotted in `/opt/homepage/backups/`:
+The nightly `/opt/backups/backup.sh` also archives `/opt/homepage/data`
+(links, users/roles, agent config and the session secret) to
+`workstation_<stamp>.tar.gz` in R2, with 7-day retention. It ran successfully on
+21 Nov 2026 with HTTP 200. Individual changes are still snapshotted in
+`/opt/homepage/backups/`:
 
 | File pattern | Restores |
 | --- | --- |
@@ -187,7 +189,6 @@ Every change is snapshotted in `/opt/homepage/backups/`:
 | `server.py.<stamp>` | Workstation API and link validation |
 | `app.js.<stamp>` | Workstation front end |
 | `docker-compose.yml.<stamp>` | container topology |
-| `kuma.db.<stamp>` | Uptime Kuma status page |
 | `env.<stamp>` | integration secrets |
 
 Example — restore the Caddyfile:
@@ -207,10 +208,20 @@ cd /opt/homepage && docker compose restart hubapi
 ## Verification
 
 ```
-curl -s -o /dev/null -w '%{http_code}\n' https://home.merqato.digital                      # 401
-curl -s -o /dev/null -w '%{http_code}\n' -u david:$PW https://home.merqato.digital        # 200
-curl -s -o /dev/null -w '%{http_code}\n' -u david:$PW https://home.merqato.digital/hub/summary.json
-curl -s -o /dev/null -w '%{http_code}\n' -u david:$PW https://home.merqato.digital/hub/projects.json
-curl -s -o /dev/null -w '%{http_code}\n' https://work.merqato.digital                     # 302 -> Access
-curl -s -o /dev/null -w '%{http_code}\n' https://status.merqato.digital/api/status-page/merqato   # 200
+curl -s -o /dev/null -w '%{http_code}\n' https://work.merqato.digital/api/health            # 200
+curl -s -o /dev/null -w '%{http_code}\n' https://home.merqato.digital/                      # 301 -> work.
+curl -s -o /dev/null -w '%{http_code}\n' https://dash.merqato.digital/                     # 301 -> work.
+curl -s -o /dev/null -w '%{http_code}\n' https://work.merqato.digital/api/session           # ok:false
+curl -s -o /dev/null -w '%{http_code}\n' https://work.merqato.digital/hub/summary.json      # 200
 ```
+
+Scheduled scan (manual run and verification):
+
+```
+WS_DATA_DIR=/opt/homepage/data HUB_URL=http://127.0.0.1:3010 \
+  /usr/bin/python3 /opt/homepage/app/scan.py
+cat /opt/homepage/data/scans.json | head -20
+```
+
+Scans run at 16:00, 19:00, 21:00, 01:00, 04:00, 07:00, 10:00 and 13:00 UTC —
+12AM, 3AM, 5AM, 9AM, 12PM, 3PM, 6PM and 9PM Manila time.

@@ -72,8 +72,8 @@
             - field: cert_min_days
               label: Cert days
     - GitHub:
-        href: https://github.com/merqatodigital
-        description: merqatodigital · 46 repos incl. private
+        href: https://github.com/palawan-collective
+        description: palawan-collective · 38 repos incl. private
         icon: github
         widget:
           type: customapi
@@ -207,8 +207,8 @@
             - field: inv_deploy_errors
               label: Deploy err
     - Project Inventory Repo:
-        href: https://github.com/merqatodigital/projects
-        description: GitHub dashboard with Vercel URLs
+        href: https://github.com/palawan-collective
+        description: Project inventory source (inventory.json repo not yet recreated)
         icon: github
     - Amates Solutions:
         href: https://amatessolutions-automation.vercel.app
@@ -218,10 +218,10 @@
         href: https://francescas-landscaping.vercel.app
         description: Client site
         icon: vercel
-    - Golden Goose Eggs:
-        href: https://golden-goose-eggs-work.vercel.app
-        description: Client site
-        icon: vercel
+    - Golden Goose Eggs Work:
+        href: https://github.com/palawan-collective/golden-goose-eggs-work
+        description: Client project repository
+        icon: github
     - SBI Wellness:
         href: https://sbi-wellness.vercel.app
         description: Client deck
@@ -258,9 +258,5 @@
         icon: vercel
     - Azarraga Glass:
         href: https://azarraga.merqato.digital
-        description: Client site
-        icon: vercel
-    - SANVIC:
-        href: https://sanvic.merqato.digital
         description: Client site
         icon: vercel

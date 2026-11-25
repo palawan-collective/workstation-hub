@@ -32,6 +32,25 @@ class UrlValidationTests(unittest.TestCase):
             self.assertTrue(error)
 
 
+class StarterLinkTests(unittest.TestCase):
+    def test_golden_goose_uses_the_current_repository(self):
+        links = server.seed_links()
+        golden_goose = [
+            link for link in links
+            if link["name"] == "Golden Goose Eggs Work"
+        ]
+
+        self.assertEqual(len(golden_goose), 1)
+        self.assertEqual(
+            golden_goose[0]["url"],
+            "https://github.com/palawan-collective/golden-goose-eggs-work",
+        )
+        self.assertFalse(any(
+            link["url"] == "https://sanvic.merqato.digital"
+            for link in links
+        ))
+
+
 class IconValidationTests(unittest.TestCase):
     def test_accepts_lucide_style_names(self):
         for value in ("folder-git-2", "cloud_cog", "triangle"):

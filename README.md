@@ -22,20 +22,27 @@ tests/                   Python and JavaScript regression tests
 WORKSTATION.md           operations, rollback, verification
 ```
 
-## The two hosts
+## The host
 
 | Host | Serves |
 | --- | --- |
-| `home.merqato.digital` | the Workstation app (`app/`, port 3005) |
-| `work.merqato.digital` | the legacy Homepage dashboard (port 3003), kept as a fallback |
+| `work.merqato.digital` | the Workstation app (`app/`, port 3005) — the only dashboard |
 
-`dash.merqato.digital` permanently redirects to `home.merqato.digital`.
+`home.merqato.digital` and `dash.merqato.digital` permanently redirect to
+`work.merqato.digital`. The legacy Homepage container (port 3003) is stopped;
+do not re-enable it or split the dashboard across hosts again.
 
 ## Quick Links Manager
 
 Add, edit, delete, pin, drag-reorder, instant search, category filters, grid or
 list layout, and JSON export/import. Links live server-side in `data/links.json`
-with an atomic write and a timestamped backup on every change.
+with an atomic write and a timestamped backup on every change. The same card
+controls are available in Infrastructure, Projects and Clients, each with its
+own Add button preset to that category. Export/import preserves link ids.
+
+Writes require `admin` or `operator`; `viewer` is read-only. Role changes and
+user removal work with full email usernames (the API decodes URL-escaped paths).
+The link editor also sets the Lucide icon name.
 
 Writes need a signed session cookie plus a same-origin check; URLs must be plain
 HTTP(S) with no embedded credentials. Saved link names remain stable when Lucide
@@ -68,9 +75,12 @@ without rewriting the saved data.
 | `homepage` | 3003 | legacy Homepage fallback |
 | `files` | 3004 | static downloads |
 
-The edge-routing example is in `Caddyfile.example`. The canonical `home` host
-uses Basic Auth and routes to port 3005; the Access-protected `work` host keeps
-the legacy Homepage on port 3003. Both expose `/hub/*` on port 3010.
+The edge-routing example is in `Caddyfile.example`. The `work` host is the only
+dashboard and routes to port 3005; `home` and `dash` redirect to it. Cloudflare
+Access was removed. Login is handled by the app itself (`app/admin.py`): the
+first admin is seeded from `WS_ADMIN_USER` / `WS_ADMIN_PASSWORD`, and Settings
+provides password change, user management with roles (admin/operator/viewer),
+and the Agent engine. It exposes `/hub/*` on port 3010 and `/files/*` on port 3004.
 
 ## Run and verify
 
@@ -103,7 +113,7 @@ python -m py_compile app/server.py hub/hub.py
 | `VERCEL_TOKEN` | read-only REST access | project and deployment counts |
 | `RESEND_API_KEY` | read-only REST access | domain and delivery-event counts |
 | `ALERT_KEY` | webhook secret | required for `/alert`; the sender must include `X-Hub-Key` with this value |
-| `INVENTORY_REPO` | GitHub repository | defaults to `merqatodigital/projects` |
+| `INVENTORY_REPO` | GitHub repository | defaults to `palawan-collective/projects` |
 | `CACHE_TTL` | none | seconds, default 60 |
 | `PROBE_TIMEOUT` | none | HTTPS probe timeout in seconds, default 20 |
 
@@ -119,8 +129,9 @@ available: `/domains.json`, `/cloudflare.json`, `/docker.json`, `/github.json`,
 - `dockerproxy` exposes only `CONTAINERS`, `VERSION`, and `INFO`. `EXEC=0` and
   `POST=0` mean a compromised dashboard cannot start a container.
 - The `/alert` webhook requires `ALERT_KEY` and fails closed when it is absent.
-  Configure the Uptime Kuma webhook to send the same value in the `X-Hub-Key`
-  header; a missing or incorrect header returns 403 before the body is read.
+  Senders must supply the same value in the `X-Hub-Key` header; a missing or
+  incorrect header returns 403 before the body is read. No sender is configured
+  since Uptime Kuma was retired.
 - Host ports 3004/3005/3010 must stay off the public firewall; Caddy and its
   edge authentication are the public boundary.
 - The hub never returns a token, only counts and normalized rows derived from one.

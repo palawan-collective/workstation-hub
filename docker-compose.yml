@@ -39,9 +39,9 @@ services:
       - /opt/homepage/hub:/app:ro
     environment:
       CF_API_TOKEN: ${CF_API_TOKEN}
-      GITHUB_ACCOUNTS: ${GITHUB_ACCOUNTS:-merqatodigital,sanvicpalawan,merqato}
+      GITHUB_ACCOUNTS: ${GITHUB_ACCOUNTS:-palawan-collective}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
-      INVENTORY_REPO: ${INVENTORY_REPO:-merqatodigital/projects}
+      INVENTORY_REPO: ${INVENTORY_REPO:-palawan-collective/projects}
       VERCEL_TOKEN: ${VERCEL_TOKEN}
       RESEND_API_KEY: ${RESEND_API_KEY}
       ALERT_KEY: ${ALERT_KEY}
@@ -81,6 +81,9 @@ services:
       WS_PORT: "3005"
       WS_DATA_DIR: /data
       WS_STATIC_DIR: /app/static
+      WS_ADMIN_USER: ${WS_ADMIN_USER:-david@merqato.digital}
+      WS_ADMIN_PASSWORD: ${WS_ADMIN_PASSWORD:?set WS_ADMIN_PASSWORD in .env}
+      HUB_URL: http://host.docker.internal:3010
     ports:
       - "3005:3005"
     restart: unless-stopped

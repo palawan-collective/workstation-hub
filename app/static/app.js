@@ -40,6 +40,11 @@
     metrics: null,
     projects: [],
     hubUp: null,
+    user: null,
+    agentConfig: null,
+    models: [],
+    agentReply: "",
+    scans: [],
     view: "overview",
     query: "",
     category: "All",
@@ -47,6 +52,7 @@
     theme: localStorage.getItem("ws.theme") || "dark",
     loaded: false,
     busy: false,
+    formDirty: false,
   };
 
   // ------------------------------------------------------------------ utils
@@ -54,6 +60,13 @@
     String(value ?? "").replace(/[&<>"']/g, (c) => (
       { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
     ));
+
+  // Never let a runaway upstream string (e.g. a Cloudflare Access login page)
+  // stretch a metric card or a table cell across the layout.
+  const short = (value, limit = 90) => {
+    const text = String(value ?? "").replace(/\s+/g, " ").trim();
+    return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
+  };
 
   function pascalIconName(name) {
     return String(name).split(/[-_\s]+/).filter(Boolean)
@@ -178,8 +191,30 @@
     return data;
   }
 
-  async function ensureSession() {
-    try { await api("/api/session"); } catch { /* session is best-effort */ }
+  async function loadModels(refresh = false) {
+    const provider = state.agentConfig?.provider === "ollama" ? "ollama" : "openrouter";
+    const data = await api(`/api/agent/models?provider=${provider}${refresh ? "&refresh=1" : ""}`);
+    state.models = data.models || [];
+    return data;
+  }
+
+  async function loadScans() {
+    try {
+      const data = await api("/api/scans");
+      state.scans = data.scans || [];
+    } catch { state.scans = []; }
+  }
+
+  async function loadAdmin() {
+    if (!isAdmin()) return;
+    try {
+      const [users, cfg] = await Promise.all([api("/api/users"), api("/api/agent/config")]);
+      state.users = users.users || [];
+      state.agentConfig = cfg;
+      if (!state.models.length) await loadModels();
+    } catch (err) {
+      console.warn("Admin data unavailable", err);
+    }
   }
 
   async function loadLinks() {
@@ -189,7 +224,7 @@
 
   async function loadMetrics() {
     const [summary, projects] = await Promise.all([
-      api("/hub/summary.json"),
+      api("/hub/summary.json").catch(() => ({})),
       api("/hub/projects.json").catch(() => ({ projects: [] })),
     ]);
     state.metrics = summary;
@@ -225,9 +260,9 @@
     return `
       <div class="card metric">
         <div class="metric-top">${icon(iconName)}${esc(label)}</div>
-        <div class="metric-value">${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}</div>
+        <div class="metric-value">${esc(short(value, 24))}${unit ? `<small>${esc(short(unit, 24))}</small>` : ""}</div>
         ${width == null ? "" : `<div class="metric-bar"><span style="width:${width}%"${tone ? ` data-tone="${tone}"` : ""}></span></div>`}
-        ${foot ? `<div class="metric-foot"><span>${esc(foot)}</span></div>` : ""}
+        ${foot ? `<div class="metric-foot"><span>${esc(short(foot))}</span></div>` : ""}
       </div>`;
   }
 
@@ -349,6 +384,20 @@
       </section>
 
       <section>
+        <div class="section-head"><h2 class="section-title">Daily scan</h2>
+          <span style="display:flex;gap:8px;align-items:center">
+            ${canWrite() ? `<button class="btn btn-sm" data-action="run-scan">${icon("refresh-cw")}Run scan now</button>` : ""}
+            <a class="section-note" href="#agents">Agent details →</a>
+          </span></div>
+        <div class="card panel">
+          ${state.scans.length
+            ? `<div class="scan-summary" data-tone="${state.scans[0].all_clear ? "ok" : "danger"}">${esc(state.scans[0].summary)}</div>
+               <p class="muted">Last scan ${esc(state.scans[0].at.replace("T", " ").replace("Z", " UTC"))} · ${state.scans.length} stored · scheduled 12AM, 3AM, 5AM, 9AM, 12PM, 3PM, 6PM, 9PM Manila time</p>`
+            : `<p class="muted">No scan recorded yet. Use Run scan now.</p>`}
+        </div>
+      </section>
+
+      <section>
         <div class="section-head"><h2 class="section-title">Needs attention</h2></div>
         ${alertsHtml}
       </section>`;
@@ -380,16 +429,30 @@
           ${link.description ? `<div class="link-desc">${esc(link.description)}</div>` : ""}
           <div class="link-url">${esc(link.url)}</div>
         </div>
-        <div class="link-tools">
+        ${canWrite() ? `<div class="link-tools">
           <button class="icon-btn pin-btn" data-action="pin" data-id="${esc(link.id)}" title="${link.pinned ? "Unpin" : "Pin"}" aria-label="${link.pinned ? "Unpin" : "Pin"} ${esc(link.name)}">${icon("pin")}</button>
           <button class="icon-btn" data-action="edit" data-id="${esc(link.id)}" title="Edit" aria-label="Edit ${esc(link.name)}">${icon("pencil")}</button>
           <button class="icon-btn" data-action="delete" data-id="${esc(link.id)}" title="Delete" aria-label="Delete ${esc(link.name)}">${icon("trash-2")}</button>
-        </div>
+        </div>` : ""}
       </div>`;
   }
 
   function emptyState(iconName, title, text, action) {
     return `<div class="empty">${icon(iconName)}<strong>${esc(title)}</strong><p>${esc(text)}</p>${action || ""}</div>`;
+  }
+
+  const canWrite = () => !!state.user && ["admin", "operator"].includes(state.user.role);
+
+  function addButton(category, label) {
+    return canWrite()
+      ? `<button class="btn btn-sm" data-action="add" data-add-category="${esc(category)}">${icon("plus")}${esc(label || "Add")}</button>`
+      : "";
+  }
+
+  function customLinks(category, emptyText) {
+    const links = state.links.filter((l) => l.category === category);
+    if (!links.length) return emptyState("link", "Nothing here yet", emptyText);
+    return `<div class="link-grid${state.layout === "list" ? " list" : ""}">${links.map(linkCard).join("")}</div>`;
   }
 
   function visibleLinks() {
@@ -444,7 +507,7 @@
       ["Certificates", `soonest expiry in ${m.cert_min_days} days`],
       ["GitHub", `${m.github_visible_repos} repos · ${m.github_private_repos} private`],
       ["Vercel", `${m.vc_projects} projects · ${m.vc_ready} ready · ${m.vc_errors} errors`],
-      ["Coolify", `v${m.coolify_version} · ${m.coolify_apps} apps · ${m.coolify_reachable} server reachable`],
+      ["Coolify", `v${short(m.coolify_version, 20)} · ${m.coolify_apps} apps · ${m.coolify_reachable} server reachable`],
       ["Cloudflare", `${m.cf_zones} zone · ${m.cf_dns_records} DNS records`],
       ["Resend", `${m.rs_delivered} delivered · ${m.rs_bounced} bounced · ${m.rs_failed} failed`],
       ["Data as of", (m.updated || "—").replace("T", " ").replace("Z", " UTC")],
@@ -453,10 +516,30 @@
     return `
       <section>
         <div class="section-head"><h2 class="section-title">Live readings</h2>
-          <button class="btn btn-sm" data-action="refresh">${icon("refresh-cw")}Refresh</button></div>
+          <span style="display:flex;gap:6px">
+            <button class="btn btn-sm" data-action="refresh">${icon("refresh-cw")}Refresh</button>
+            ${addButton("Infrastructure", "Add link")}
+          </span></div>
         <div class="card panel">
           <dl class="kv">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
         </div>
+      </section>
+
+      <section>
+        <div class="section-head"><h2 class="section-title">Saved infrastructure links</h2><span class="section-note">editable</span></div>
+        ${customLinks("Infrastructure", "Add a service link to keep it beside the live readings.")}
+      </section>
+
+      <section>
+        <div class="section-head"><h2 class="section-title">Scan history</h2><span class="section-note">${state.scans.length} runs stored</span></div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>When (UTC)</th><th>Result</th><th>Failing hosts</th></tr></thead>
+          <tbody>${state.scans.slice(0, 12).map((s) => `<tr>
+            <td class="sub">${esc(s.at.replace("T", " ").replace("Z", ""))}</td>
+            <td><span class="badge" data-tone="${s.all_clear ? "ok" : "danger"}"><span class="dot"></span>${s.all_clear ? "All clear" : s.failing + " failing"}</span></td>
+            <td class="sub">${esc(s.failing_hosts.map((h) => h.host).join(", ") || "—")}</td>
+          </tr>`).join("") || `<tr><td colspan="3" class="sub">No scans yet.</td></tr>`}</tbody>
+        </table></div>
       </section>`;
   }
 
@@ -466,8 +549,10 @@
       !q || [p.name, p.repo, p.url].join(" ").toLowerCase().includes(q));
 
     if (!state.projects.length) {
-      return `<section><div class="section-head"><h2 class="section-title">Projects</h2><span class="section-note">Inventory snapshot</span></div>
-        ${emptyState("folder-git-2", "No project data", "The projects inventory is not reachable right now.")}</section>`;
+      return `<section><div class="section-head"><h2 class="section-title">Projects</h2>
+        ${addButton("Projects", "Add project")}</div>
+        ${emptyState("folder-git-2", "No project data", "The projects inventory is not reachable right now. You can still add your own.")}
+        ${customLinks("Projects", "Add a project link to track it here.")}</section>`;
     }
 
     const rows = projects.map((p) => {
@@ -486,63 +571,169 @@
 
     return `
       <section>
-        <div class="section-head"><h2 class="section-title">Projects</h2><span class="section-note">${projects.length} of ${state.projects.length}</span></div>
+        <div class="section-head"><h2 class="section-title">Projects</h2>
+          <span style="display:flex;gap:8px;align-items:center"><span class="section-note">${projects.length} of ${state.projects.length}</span>${addButton("Projects", "Add project")}</span></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Project</th><th>Live URL</th><th>Repository</th><th>State</th><th>Updated</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>
+      </section>
+
+      <section>
+        <div class="section-head"><h2 class="section-title">Saved project links</h2><span class="section-note">editable</span></div>
+        ${customLinks("Projects", "Add a project link to track it here.")}
       </section>`;
   }
 
   function viewClients() {
     const q = state.query.trim().toLowerCase();
     const links = state.links.filter((l) =>
-      (l.category === "Clients" || l.category === "Projects") &&
+      l.category === "Clients" &&
       (!q || [l.name, l.url, l.description].join(" ").toLowerCase().includes(q)));
 
     return `
       <section>
-        <div class="section-head"><h2 class="section-title">Client sites</h2><span class="section-note">${links.length} tracked</span></div>
+        <div class="section-head"><h2 class="section-title">Client sites</h2>
+          <span style="display:flex;gap:8px;align-items:center"><span class="section-note">${links.length} tracked</span>${addButton("Clients", "Add site")}</span></div>
         ${links.length
           ? `<div class="link-grid${state.layout === "list" ? " list" : ""}">${links.map(linkCard).join("")}</div>`
-          : emptyState("building-2", "No client sites tracked", "Add links in the Clients category to see them here.")}
+          : emptyState("building-2", "No client sites tracked", "Use Add site to create one.")}
       </section>`;
   }
 
+  function viewLogin() {
+    return `
+      <section class="login-wrap">
+        <form id="login-form" class="card panel login-card">
+          <h2 class="section-title">Sign in to Workstation</h2>
+          <p class="muted">One account for this dashboard. Use your MerQato email.</p>
+          <label class="field">Email
+            <input name="username" type="email" required autocomplete="username" value="david@merqato.digital" />
+          </label>
+          <label class="field">Password
+            <input name="password" type="password" required autocomplete="current-password" />
+          </label>
+          <button class="btn btn-primary" type="submit">Sign in</button>
+          <p id="login-error" class="error-text" hidden></p>
+        </form>
+      </section>`;
+  }
+
+  const isAdmin = () => state.user && state.user.role === "admin";
+
+  function modelOptions() {
+    if (!state.models.length) return `<option value="">No models loaded — press Refresh</option>`;
+    return state.models.map((m) =>
+      `<option value="${esc(m.id)}"${m.id === state.agentConfig?.model ? " selected" : ""}>${esc(m.name)} — free</option>`
+    ).join("");
+  }
+
   function viewAgents() {
+    const cfg = state.agentConfig || {};
+    const latest = state.scans[0];
     return `
       <section>
-        <div class="section-head"><h2 class="section-title">Agent access</h2>
-          <span class="badge" data-tone="${state.hubUp ? "ok" : "danger"}"><span class="dot"></span>${state.hubUp ? "Hub reachable" : "Hub unreachable"}</span></div>
+        <div class="section-head"><h2 class="section-title">Agent job — site scan</h2>
+          <span class="badge" data-tone="${latest ? (latest.all_clear ? "ok" : "danger") : "muted"}"><span class="dot"></span>${latest ? (latest.all_clear ? "All clear" : "Attention needed") : "No scan yet"}</span></div>
         <div class="card panel">
+          <p class="muted" style="font-size:13px">The agent's job is small and specific: scan every public site on a schedule, stay quiet when everything is green, and report only what is actually broken. It runs at 12AM, 3AM, 5AM, 9AM, 12PM, 3PM, 6PM and 9PM Manila time, plus any manual run from here or the Overview.</p>
           <dl class="kv">
-            <dt>Identity</dt><dd>deploy@95.111.196.120</dd>
-            <dt>Key</dt><dd>~/.ssh/merqato_deploy (key-only, no password)</dd>
-            <dt>Can do</dt><dd>read container state and logs, restart the dashboard stack, read host metrics</dd>
-            <dt>Cannot do</dt><dd>root commands, create containers, touch other stacks, read secret files</dd>
-            <dt>Audit log</dt><dd>/var/log/agent-actions.log</dd>
-            <dt>Coolify token</dt><dd>read + deploy (no create, no delete)</dd>
-            <dt>Dashboard</dt><dd>${state.hubUp ? "hub API responding" : "hub API not responding"}</dd>
+            <dt>Scanner</dt><dd>hub HTTPS probe — one source of truth for all ${latest ? latest.total : "—"} public hosts</dd>
+            <dt>Schedule</dt><dd>8 runs daily · Manila time (UTC+8)</dd>
+            <dt>Last result</dt><dd>${latest ? esc(latest.summary) : "No scan recorded yet"}</dd>
+            <dt>Last run</dt><dd>${latest ? esc(latest.at.replace("T", " ").replace("Z", " UTC")) : "—"}</dd>
+            <dt>Stored runs</dt><dd>${state.scans.length}</dd>
           </dl>
+          ${canWrite() ? `<button class="btn btn-primary" data-action="run-scan">${icon("refresh-cw")}Run scan now</button>` : ""}
         </div>
       </section>
 
       <section>
-        <div class="section-head"><h2 class="section-title">Notes</h2></div>
-        <div class="card panel">
-          <p style="font-size:12.5px;color:var(--text-2)">
-            Agents work through a dedicated scoped identity. Owner approval is still required for
-            deletions, credential rotation, production DNS changes and irreversible infrastructure work.
-          </p>
-        </div>
+        <div class="section-head"><h2 class="section-title">Latest report</h2></div>
+        <pre class="reply">${esc(latest ? latest.summary + "\n\nFailing: " + (latest.failing_hosts.map((h) => h.host + " — " + h.reason).join(", ") || "none") + "\nSlow: " + (latest.slow_hosts.join(", ") || "none") + "\nCertificates: min " + Math.min(...Object.values(latest.certs || {}).map(Number).filter((n) => !isNaN(n)), 9999) + " days" : "Run a scan to see a report.")}</pre>
+      </section>
+
+      <section>
+        <div class="section-head"><h2 class="section-title">Ask about the dashboard</h2></div>
+        <form id="chat-form" class="card panel stack-form">
+          <textarea name="message" rows="3" placeholder="e.g. What did the last scan find?" required></textarea>
+          <button class="btn btn-sm" type="submit">Send</button>
+          <p class="muted">Optional. Uses the free model in Settings → Agent engine. The scan reports above are factual and do not need a model.</p>
+          <pre class="reply" id="agent-reply">${esc(state.agentReply || "Reply appears here.")}</pre>
+        </form>
       </section>`;
   }
 
   function viewSettings() {
     const linkCount = state.links.length;
+    const users = state.users || [];
+    const cfg = state.agentConfig || {};
     return `
+      <section>
+        <div class="section-head"><h2 class="section-title">Account</h2>
+          <span class="section-note">Signed in as ${esc(state.user?.username || "")} · ${esc(state.user?.role || "")}</span></div>
+        <form id="password-form" class="card panel stack-form">
+          <label class="field">Current password<input name="current" type="password" required autocomplete="current-password" /></label>
+          <label class="field">New password<input name="new" type="password" required minlength="12" autocomplete="new-password" /></label>
+          <label class="field">Confirm new password<input name="confirm" type="password" required minlength="12" autocomplete="new-password" /></label>
+          <button class="btn btn-primary" type="submit">Change password</button>
+        </form>
+      </section>
+
+      ${isAdmin() ? `
+      <section>
+        <div class="section-head"><h2 class="section-title">Users &amp; roles</h2><span class="section-note">${users.length} accounts</span></div>
+        <div class="card panel">
+          <table class="data-table"><thead><tr><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead>
+            <tbody>${users.map((u) => `
+              <tr>
+                <td>${esc(u.username)}</td>
+                <td><select data-user-role="${esc(u.username)}">
+                  ${["admin", "operator", "viewer"].map((r) => `<option${r === u.role ? " selected" : ""}>${r}</option>`).join("")}
+                </select></td>
+                <td>${u.disabled ? "disabled" : "active"}</td>
+                <td><button class="btn btn-sm btn-danger" data-action="delete-user" data-id="${esc(u.username)}">Remove</button></td>
+              </tr>`).join("")}</tbody>
+          </table>
+          <form id="user-form" class="stack-form inline-form">
+            <input name="username" type="email" placeholder="name@merqato.digital" required />
+            <input name="password" type="password" placeholder="temporary password (12+ chars)" minlength="12" required />
+            <select name="role"><option>viewer</option><option>operator</option><option>admin</option></select>
+            <button class="btn btn-primary btn-sm" type="submit">Add user</button>
+          </form>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head"><h2 class="section-title">Agent engine</h2>
+          <span class="badge" data-tone="${cfg.enabled ? "ok" : "muted"}">${cfg.provider === "ollama" ? "Ollama" : "OpenRouter"}</span></div>
+        <form id="agent-form" class="card panel stack-form">
+          <label class="field">Provider
+            <select name="provider" id="agent-provider">
+              <option value="openrouter"${cfg.provider === "openrouter" ? " selected" : ""}>OpenRouter — free models</option>
+              <option value="ollama"${cfg.provider === "ollama" ? " selected" : ""}>Ollama — local machine</option>
+            </select>
+          </label>
+          <label class="field">OpenRouter API key
+            <span class="muted">${cfg.openrouter_key_set ? "Key saved — leave blank to keep it" : "No key saved yet"}</span>
+            <input name="openrouter_key" type="password" value="" placeholder="${cfg.openrouter_key_set ? "Leave blank to keep saved key" : "sk-or-…"}" autocomplete="off" />
+          </label>
+          <label class="field">Ollama URL
+            <input name="ollama_url" type="url" value="${esc(cfg.ollama_url || "http://127.0.0.1:11434")}" />
+          </label>
+          <label class="field">Model
+            <span class="model-row"><select name="model" id="agent-model">${modelOptions()}</select>
+            <button class="btn btn-sm" type="button" data-action="refresh-models">${icon("refresh-cw")}Refresh models</button></span>
+          </label>
+          <label class="field">Temperature <input name="temperature" type="number" min="0" max="1" step="0.1" value="${Number(cfg.temperature ?? 0.2).toFixed(1)}" /></label>
+          <label class="field">System prompt <textarea name="system_prompt" rows="3">${esc(cfg.system_prompt || "")}</textarea></label>
+          <label class="check"><input name="enabled" type="checkbox"${cfg.enabled ? " checked" : ""} /> Enable agent</label>
+          <button class="btn btn-primary" type="submit">Save agent settings</button>
+        </form>
+      </section>` : ""}
+
       <section>
         <div class="section-head"><h2 class="section-title">Appearance</h2></div>
         <div class="card panel">
@@ -578,7 +769,8 @@
             <dt>Version</dt><dd>2026.11</dd>
             <dt>Metrics source</dt><dd>/hub/summary.json (hub API)</dd>
             <dt>Links storage</dt><dd>server-side JSON with backups on every change</dd>
-            <dt>Write access</dt><dd>owner session only</dd>
+            <dt>Signed in</dt><dd>${esc(state.user?.username || "")} (${esc(state.user?.role || "")})</dd>
+            <dt>Sign out</dt><dd><button class="btn btn-sm" data-action="logout">Sign out</button></dd>
           </dl>
         </div>
       </section>`;
@@ -586,6 +778,17 @@
 
   // ----------------------------------------------------------------- render
   function render() {
+    state.formDirty = false;
+    if (!state.user) {
+      $("#page-title").textContent = "Sign in";
+      document.title = "Sign in · MerQato Workstation";
+      $("#nav").innerHTML = "";
+      $("#view").innerHTML = viewLogin();
+      if (window.lucide) window.lucide.createIcons();
+      return;
+    }
+    const addBtn = $("#add-link-btn");
+    if (addBtn) addBtn.hidden = !canWrite();
     const titles = Object.fromEntries(NAV.map((n) => [n.id, n.label]));
     $("#page-title").textContent = titles[state.view] || "Overview";
     document.title = `${titles[state.view] || "Overview"} · MerQato Workstation`;
@@ -607,13 +810,15 @@
   }
 
   // ----------------------------------------------------------------- modals
-  function openModal(link) {
+  function openModal(link, category) {
     $("#f-id").value = link ? link.id : "";
     $("#f-name").value = link ? link.name : "";
     $("#f-url").value = link ? link.url : "";
     $("#f-category").innerHTML = CATEGORIES.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
-    $("#f-category").value = link ? link.category : (state.category === "All" ? "Other" : state.category);
+    const preset = category || (state.category === "All" ? "Other" : state.category);
+    $("#f-category").value = link ? link.category : preset;
     $("#f-desc").value = link ? (link.description || "") : "";
+    $("#f-icon").value = link ? (link.icon || "") : "";
     $("#f-pinned").checked = link ? !!link.pinned : false;
     $("#f-error").hidden = true;
     $$(".input").forEach((i) => i.removeAttribute("aria-invalid"));
@@ -635,6 +840,7 @@
       url: $("#f-url").value.trim(),
       category: $("#f-category").value,
       description: $("#f-desc").value.trim(),
+      icon: $("#f-icon").value.trim() || "link",
       pinned: $("#f-pinned").checked,
     };
     const btn = $("#f-save");
@@ -653,8 +859,8 @@
       $("#f-error").textContent = err.message;
       $("#f-error").hidden = false;
       if (err.status === 401) {
-        await ensureSession();
-        toast("Session renewed — please save again", "error");
+        toast("Session expired — reloading to sign in again", "error");
+        setTimeout(() => location.reload(), 900);
       }
     } finally {
       btn.disabled = false;
@@ -731,9 +937,50 @@
       const action = target.dataset.action;
       const id = target.dataset.id;
 
-      if (action === "add") return openModal(null);
+      if (action === "add") return openModal(null, target.dataset.addCategory);
       if (action === "refresh") return refresh(true);
+      if (action === "run-scan") {
+        try {
+          const report = await api("/api/agent/scan", { method: "POST", body: "{}" });
+          await loadScans();
+          render();
+          toast(report.summary || "Scan complete", report.all_clear ? "ok" : "error");
+        } catch (err) { toast(err.message, "error"); }
+        return;
+      }
       if (action === "theme") return toggleTheme();
+      if (action === "logout") {
+        try { await api("/api/logout", { method: "POST", body: "{}" }); } catch {}
+        state.user = null;
+        state.links = [];
+        state.models = [];
+        state.metrics = null;
+        state.projects = [];
+        state.users = [];
+        state.agentConfig = null;
+        state.agentReply = "";
+        state.formDirty = false;
+        render();
+        return;
+      }
+      if (action === "refresh-models") {
+        try {
+          const data = await loadModels(true);
+          render();
+          toast(`${data.models.length} free models synced`);
+        } catch (err) { toast(err.message, "error"); }
+        return;
+      }
+      if (action === "delete-user") {
+        if (!confirm(`Remove ${id}?`)) return;
+        try {
+          await api(`/api/users/${encodeURIComponent(id)}`, { method: "DELETE" });
+          await loadAdmin();
+          render();
+          toast("User removed");
+        } catch (err) { toast(err.message, "error"); }
+        return;
+      }
       if (action === "open") {
         const opened = state.links.find((l) => l.id === target.dataset.id);
         const url = opened ? safeHttpUrl(opened.url) : "";
@@ -851,30 +1098,124 @@
         await refresh();
       }
     });
+
+    // account, users and agent forms
+    document.addEventListener("submit", async (e) => {
+      const form = e.target;
+      const ids = ["login-form", "password-form", "user-form", "agent-form", "chat-form"];
+      if (!form.id || !ids.includes(form.id)) return;
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(form).entries());
+      try {
+        if (form.id === "login-form") {
+          const res = await api("/api/login", { method: "POST", body: JSON.stringify(data) });
+          state.user = res.user;
+          state.view = "overview";
+          location.hash = "#overview";
+          await refresh(false);
+          toast("Welcome back");
+        } else if (form.id === "password-form") {
+          if (data.new !== data.confirm) throw new Error("New passwords do not match");
+          await api("/api/password", {
+            method: "POST",
+            body: JSON.stringify({ current: data.current, new: data.new }),
+          });
+          form.reset();
+          toast("Password changed");
+        } else if (form.id === "user-form") {
+          await api("/api/users", { method: "POST", body: JSON.stringify(data) });
+          form.reset();
+          await loadAdmin();
+          render();
+          toast("User added");
+        } else if (form.id === "agent-form") {
+          const payload = {
+            ...data,
+            enabled: !!form.elements.enabled.checked,
+            temperature: Number(data.temperature) || 0,
+          };
+          if (!payload.openrouter_key) delete payload.openrouter_key;
+          state.agentConfig = await api("/api/agent/config", {
+            method: "PUT", body: JSON.stringify(payload),
+          });
+          state.models = [];
+          await loadModels();
+          render();
+          toast("Agent settings saved");
+        } else if (form.id === "chat-form") {
+          state.agentReply = "Thinking…";
+          render();
+          const res = await api("/api/agent/chat", {
+            method: "POST", body: JSON.stringify({ message: data.message }),
+          });
+          state.agentReply = res.reply || "(no reply)";
+          render();
+        }
+      } catch (err) {
+        if (form.id === "login-form") {
+          const box = $("#login-error");
+          if (box) { box.textContent = err.message; box.hidden = false; }
+        }
+        if (form.id === "chat-form") {
+          state.agentReply = "Error: " + err.message;
+          render();
+        }
+        toast(err.message, "error");
+      }
+    });
+
+    // never wipe a form the user is filling in during a background refresh
+    document.addEventListener("input", (e) => {
+      if (state.user && e.target.closest("#view")) state.formDirty = true;
+    });
+    document.addEventListener("change", (e) => {
+      if (state.user && e.target.closest("#view")) state.formDirty = true;
+    });
+
+    // role changes on the users table
+    $("#view").addEventListener("change", async (e) => {
+      const name = e.target.dataset?.userRole;
+      if (!name) return;
+      try {
+        await api(`/api/users/${encodeURIComponent(name)}`, {
+          method: "PATCH", body: JSON.stringify({ role: e.target.value }),
+        });
+        toast("Role updated");
+      } catch (err) {
+        toast(err.message, "error");
+      }
+      await loadAdmin();
+      render();
+    });
   }
 
   // ------------------------------------------------------------------- boot
   async function refresh(announce = false) {
     try {
-      await ensureSession();
-      await Promise.all([loadLinks(), loadMetrics(), checkHub()]);
+      await Promise.all([loadLinks(), loadMetrics(), checkHub(), loadAdmin(), loadScans()]);
       state.loaded = true;
-      render();
+      if (!state.formDirty) render();
       if (announce) toast("Refreshed");
     } catch (err) {
       state.loaded = true;
-      render();
+      if (!state.formDirty) render();
       if (announce) toast(err.message, "error");
     }
   }
 
-  function boot() {
+  async function boot() {
     applyTheme(state.theme);
     state.view = location.hash.replace("#", "") || "overview";
     wire();
+    try {
+      const session = await api("/api/session");
+      state.user = session.user || null;
+    } catch {
+      state.user = null;
+    }
     render();
-    refresh(false);
-    setInterval(() => { if (!document.hidden) refresh(false); }, 60000);
+    if (state.user) await refresh(false);
+    setInterval(() => { if (!document.hidden && state.user) refresh(false); }, 60000);
   }
 
   if (document.readyState === "loading") {

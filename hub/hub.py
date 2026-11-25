@@ -37,7 +37,7 @@ PORT = env_int("HUB_PORT", 3010)
 BUILD_ID = os.environ.get("HUB_BUILD", "2026.11.19")
 CF_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 DOCKER = os.environ.get("DOCKER_API", "http://dockerproxy:2375")
-_default_accounts = "merqatodigital,sanvicpalawan,merqato"
+_default_accounts = "palawan-collective"
 GITHUB_ACCOUNTS = [
     account.strip()
     for account in (os.environ.get("GITHUB_ACCOUNTS", "").strip() or _default_accounts).split(",")
@@ -66,6 +66,22 @@ def http_text(url, headers=None, timeout=8):
     req = urllib.request.Request(url, headers=headers or {"User-Agent": "merqato-hub/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode(errors="replace").strip()
+
+
+def clean_text(value, limit=60):
+    """Return a short plain-text value, or "" for HTML/oversized content.
+
+    Upstreams behind Cloudflare Access answer with a full sign-in page; that
+    must never reach the UI as if it were a version string or a label.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if not text or len(text) > limit:
+        return ""
+    if "<" in text or ">" in text:
+        return ""
+    return text
 
 
 def safe_http_url(value):
@@ -232,25 +248,35 @@ def github_data():
             entry["public_repos"] = u.get("public_repos", 0)
             entry["name"] = u.get("name") or login
             entry["updated"] = u.get("updated_at")
+            entry["type"] = u.get("type") or "User"
             total += entry["public_repos"] or 0
         except Exception as exc:  # noqa: BLE001
             entry["error"] = str(exc)[:80]
 
-        # Authenticated pass: only meaningful for the account the token owns.
+        # Authenticated pass: org repos (incl. private) when the token can see
+        # them, and the token owner's own repos. affiliation=owner keeps the
+        # count per-account, so a user's org repos are not counted twice.
         if auth_headers:
             hdr = auth_headers
             try:
-                me = http_json("https://api.github.com/user", headers=hdr, timeout=8)
-                if (me.get("login") or "").lower() == login.lower():
+                repos = []
+                if entry.get("type") == "Organization":
                     repos = http_json(
-                        "https://api.github.com/user/repos?per_page=100"
-                        "&affiliation=owner,collaborator,organization_member",
+                        "https://api.github.com/orgs/" + login
+                        + "/repos?per_page=100&type=all",
                         headers=hdr, timeout=12)
-                    priv = sum(1 for r in repos if r.get("private"))
-                    entry["authenticated"] = True
-                    entry["total_repos"] = len(repos)
-                    entry["private_repos"] = priv
-                    entry["visibility"] = "authenticated"
+                else:
+                    me = http_json("https://api.github.com/user", headers=hdr, timeout=8)
+                    if (me.get("login") or "").lower() == login.lower():
+                        repos = http_json(
+                            "https://api.github.com/user/repos?per_page=100"
+                            "&affiliation=owner",
+                            headers=hdr, timeout=12)
+                priv = sum(1 for r in repos if r.get("private"))
+                entry["authenticated"] = bool(repos)
+                entry["total_repos"] = len(repos)
+                entry["private_repos"] = priv
+                entry["visibility"] = "authenticated"
             except Exception as exc:  # noqa: BLE001
                 entry["error"] = (entry["error"] or "") + " auth:" + str(exc)[:40]
         accounts.append(entry)
@@ -300,11 +326,15 @@ def coolify_data():
         out["error"] = "no token"
         return out
     try:
-        out["version"] = http_text(
+        raw_version = http_text(
             COOLIFY_URL + "/api/v1/version",
             headers={"Authorization": "Bearer " + COOLIFY_TOKEN, "User-Agent": "merqato-hub/1.0"},
             timeout=8,
         )
+        version = clean_text(raw_version, 40)
+        if not version:
+            raise ValueError("Coolify API returned a non-API page (Cloudflare Access?)")
+        out["version"] = version
         out["projects"] = len(coolify_get("/projects") or [])
         out["applications"] = len(coolify_get("/applications") or [])
         servers = coolify_get("/servers") or []
@@ -464,7 +494,7 @@ def vercel_summary(data):
 
 
 # ----------------------------------------------------------------- inventory
-INVENTORY_REPO = os.environ.get("INVENTORY_REPO", "merqatodigital/projects")
+INVENTORY_REPO = os.environ.get("INVENTORY_REPO", "palawan-collective/projects")
 
 
 def inventory_data():

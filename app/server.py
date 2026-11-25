@@ -9,15 +9,26 @@ which keeps one source of truth for every number on screen.
 Endpoints
     GET    /                     the SPA
     GET    /static/<file>        css, js, fonts, icons
-    GET    /api/session          establishes the owner session cookie
-    GET    /api/links            list links (public read, owner-gated writes)
-    POST   /api/links            add a link            [session]
-    PATCH  /api/links/<id>       edit a link           [session]
-    DELETE /api/links/<id>       delete a link         [session]
-    POST   /api/links/reorder    persist drag ordering [session]
-    POST   /api/links/import     replace from JSON     [session]
-    GET    /api/export           download all links as JSON
     GET    /api/health           liveness
+    POST   /api/login            username + password -> session cookie
+    POST   /api/logout           clear the session
+    GET    /api/session          current user and role
+    POST   /api/password         change own password                 [session]
+    GET    /api/links            list links                          [session]
+    POST   /api/links            add a link                          [session]
+    PATCH  /api/links/<id>       edit a link                         [session]
+    DELETE /api/links/<id>       delete a link                       [session]
+    POST   /api/links/reorder    persist drag ordering               [session]
+    POST   /api/links/import     replace from JSON                   [session]
+    GET    /api/export           download all links as JSON          [session]
+    GET    /api/users            list users                          [admin]
+    POST   /api/users            add user with role                  [admin]
+    PATCH  /api/users/<name>     change role / reset password        [admin]
+    DELETE /api/users/<name>     remove user                         [admin]
+    GET    /api/agent/config     agent settings (key masked)         [admin]
+    PUT    /api/agent/config     update agent settings               [admin]
+    GET    /api/agent/models     free models (refresh=1 to re-sync)  [admin]
+    POST   /api/agent/chat       send a message through the agent    [session]
 """
 
 import json
@@ -29,7 +40,16 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+
+try:
+    import admin
+    import scan
+except ModuleNotFoundError:  # loaded by path in unit tests
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import admin
+    import scan
 
 PORT = int(os.environ.get("WS_PORT", "3005"))
 DATA_DIR = os.environ.get("WS_DATA_DIR", "/data")
@@ -215,15 +235,15 @@ def validate(payload, partial=False):
 
 
 # ---------------------------------------------------------------------- session
-def make_session():
+def make_session(username):
     import base64
     import hashlib
     import hmac
 
     ts = str(int(time.time()))
-    raw = ts.encode()
-    sig = hmac.new(session_secret(), raw, hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(raw + b"." + sig.encode()).decode()
+    payload = base64.urlsafe_b64encode((username + "|" + ts).encode()).decode()
+    sig = hmac.new(session_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    return payload + "." + sig
 
 
 def read_session(token):
@@ -232,22 +252,33 @@ def read_session(token):
     import hmac
 
     try:
-        raw = base64.urlsafe_b64decode(token.encode())
-        ts_raw, sig = raw.split(b".", 1)
-        expected = hmac.new(session_secret(), ts_raw, hashlib.sha256).hexdigest().encode()
+        payload, sig = token.encode().split(b".", 1)
+        expected = hmac.new(session_secret(), payload, hashlib.sha256).hexdigest().encode()
         if not hmac.compare_digest(sig, expected):
-            return False
-        return (time.time() - int(ts_raw)) < SESSION_TTL
+            return None
+        decoded = base64.urlsafe_b64decode(payload).decode()
+        username, ts_raw = decoded.split("|", 1)
+        if (time.time() - int(ts_raw)) >= SESSION_TTL:
+            return None
+        user = admin.find_user(username)
+        if not user or user.get("disabled"):
+            return None
+        return {"username": user["username"], "role": user.get("role", "viewer")}
     except Exception:
-        return False
+        return None
+
+
+def cookie_for(username):
+    return "%s=%s; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=%d" % (
+        SESSION_COOKIE, make_session(username), SESSION_TTL)
 
 
 # ----------------------------------------------------------------------- seeds
 def seed_links():
     """First run: import the tools already on the old dashboard, once."""
     presets = [
-        ("GitHub", "https://github.com/merqatodigital", "Infrastructure",
-         "Repositories across merqatodigital accounts", True, "github"),
+        ("GitHub", "https://github.com/palawan-collective", "Infrastructure",
+         "All repositories consolidated in palawan-collective", True, "github"),
         ("Vercel", "https://vercel.com/merqatodigital", "Infrastructure",
          "Deployments and production URLs", True, "vercel"),
         ("Cloudflare", "https://dash.cloudflare.com/4322261acf290539b992fbd803039ca7",
@@ -268,14 +299,15 @@ def seed_links():
          "Email delivery and domains", False, "mail"),
         ("HyperLevel CRM", "https://crm.merqato.digital", "Projects",
          "Business OS: clients, deals, invoicing", False, "hyperlevel"),
-        ("Workstation Repo", "https://github.com/merqatodigital/workstation-hub",
+        ("Workstation Repo", "https://github.com/palawan-collective/workstation-hub",
          "Projects", "This dashboard's source and docs", False, "github"),
         ("Palawan Collective", "https://palawancollective.com", "Clients",
          "Agency website", False, "globe"),
         ("BAIA Lodge", "https://baia.merqato.digital", "Clients",
          "Client site", False, "globe"),
-        ("SANVIC", "https://sanvic.merqato.digital", "Clients",
-         "Client site", False, "globe"),
+        ("Golden Goose Eggs Work",
+         "https://github.com/palawan-collective/golden-goose-eggs-work",
+         "Clients", "Client project repository", False, "globe"),
         ("Azarraga Glass", "https://azarraga.merqato.digital", "Clients",
          "Client site", False, "globe"),
         ("SBI Medical Deck", "https://presentation.merqato.digital", "Clients",
@@ -327,7 +359,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authed(self):
         token = self._cookie_token()
-        return bool(token) and read_session(token)
+        return read_session(token) if token else None
+
+    def _admin(self):
+        user = self._authed()
+        if not user:
+            self._send({"error": "Sign in required"}, 401)
+            return None
+        if user.get("role") != "admin":
+            self._send({"error": "Admin access required"}, 403)
+            return None
+        return user
+
+    def _writer(self):
+        """Admins and operators may change operational data; viewers may not."""
+        user = self._authed()
+        if not user:
+            self._send({"error": "Sign in required"}, 401)
+            return None
+        if user.get("role") not in ("admin", "operator"):
+            self._send({"error": "Operator access required"}, 403)
+            return None
+        return user
 
     def _same_origin(self):
         """Reject cross-site writes even if a session cookie leaked."""
@@ -366,7 +419,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- routes
     def do_GET(self):  # noqa: N802
-        path = self.path.split("?")[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path in ("/", "/index.html"):
             return self._static("index.html")
         if path.startswith("/static/"):
@@ -376,13 +430,35 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             return self._send({"ok": True, "service": "workstation"})
         if path == "/api/session":
-            token = make_session()
-            cookie = "%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d" % (
-                SESSION_COOKIE, token, SESSION_TTL)
-            return self._send({"ok": True}, 200, extra_headers={"Set-Cookie": cookie})
+            user = self._authed()
+            return self._send({"ok": bool(user), "user": user})
+        if path == "/api/users":
+            if not self._admin():
+                return None
+            return self._send({"users": admin.list_users(), "roles": list(admin.ROLES)})
+        if path == "/api/agent/config":
+            if not self._admin():
+                return None
+            return self._send(admin.public_config())
+        if path == "/api/agent/models":
+            if not self._admin():
+                return None
+            query = parse_qs(parsed.query)
+            provider = (query.get("provider") or [None])[0]
+            refresh = (query.get("refresh") or [""])[0] == "1"
+            try:
+                return self._send(admin.fetch_models(provider, refresh=refresh))
+            except Exception as exc:
+                return self._send({"error": str(exc)}, 502)
+
+        user = self._authed()
+        if not user:
+            return self._send({"error": "Sign in required"}, 401)
+        if path == "/api/scans":
+            return self._send({"scans": scan.load_reports()[:24]})
         if path == "/api/links":
             links = sorted(load_links(), key=lambda l: (l.get("order", 0), l.get("name", "")))
-            return self._send({"links": links, "categories": CATEGORIES})
+            return self._send({"links": links, "categories": CATEGORIES, "user": user})
         if path == "/api/starter-links":
             return self._send({"links": seed_links(), "categories": CATEGORIES})
         if path == "/api/export":
@@ -394,18 +470,91 @@ class Handler(BaseHTTPRequestHandler):
         return self._send({"error": "not found"}, 404)
 
     def do_HEAD(self):  # noqa: N802
-        return self.do_GET()
+        # Never run GET logic on HEAD: it can fetch models and mutate the cache.
+        return self._send(b"", 200, "text/plain")
 
     def do_POST(self):  # noqa: N802
         path = self.path.split("?")[0]
-        if not self._authed():
-            return self._send({"error": "Your session expired. Reload the page."}, 401)
-        if not self._same_origin():
-            return self._send({"error": "Cross-site writes are not allowed"}, 403)
+        if path in ("/api/login", "/api/logout"):
+            if not self._same_origin():
+                return self._send({"error": "Cross-site writes are not allowed"}, 403)
+        else:
+            if not self._authed():
+                return self._send({"error": "Sign in required"}, 401)
+            if not self._same_origin():
+                return self._send({"error": "Cross-site writes are not allowed"}, 403)
+
+        if path == "/api/login":
+            payload, err = self._body_json()
+            if err:
+                return self._send({"error": err}, 400)
+            user = admin.authenticate(
+                (payload or {}).get("username"), (payload or {}).get("password"))
+            if not user:
+                return self._send({"error": "Incorrect username or password"}, 401)
+            return self._send(
+                {"ok": True, "user": user}, 200,
+                extra_headers={"Set-Cookie": cookie_for(user["username"])})
+
+        if path == "/api/logout":
+            return self._send({"ok": True}, 200, extra_headers={
+                "Set-Cookie": SESSION_COOKIE + "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"})
 
         if path == "/api/session":
             return self._send({"ok": True})
 
+        user = self._authed()
+        if path == "/api/password":
+            payload, err = self._body_json()
+            if err:
+                return self._send({"error": err}, 400)
+            try:
+                admin.change_password(
+                    user["username"], (payload or {}).get("current"),
+                    (payload or {}).get("new"))
+            except (ValueError, PermissionError) as exc:
+                return self._send({"error": str(exc)}, 400)
+            return self._send({"ok": True, "message": "Password changed"})
+
+        if path == "/api/users":
+            if user.get("role") != "admin":
+                return self._send({"error": "Admin access required"}, 403)
+            payload, err = self._body_json()
+            if err:
+                return self._send({"error": err}, 400)
+            try:
+                name = admin.add_user(
+                    (payload or {}).get("username"), (payload or {}).get("password"),
+                    (payload or {}).get("role", "viewer"))
+            except (ValueError, PermissionError) as exc:
+                return self._send({"error": str(exc)}, 400)
+            return self._send({"ok": True, "username": name}, 201)
+
+        if path == "/api/agent/scan":
+            if not self._writer():
+                return None
+            try:
+                return self._send(scan.run_and_save())
+            except Exception as exc:
+                return self._send({"error": str(exc)}, 400)
+
+        if path == "/api/agent/chat":
+            if user.get("role") not in ("admin", "operator"):
+                return self._send({"error": "Operator access required"}, 403)
+            payload, err = self._body_json()
+            if err:
+                return self._send({"error": err}, 400)
+            message = (payload or {}).get("message", "")
+            if not isinstance(message, str) or not message.strip():
+                return self._send({"error": "Message is required"}, 400)
+            try:
+                return self._send({"reply": admin.chat(message[:4000])})
+            except Exception as exc:
+                # 4xx keeps the real message visible through Cloudflare.
+                return self._send({"error": str(exc)}, 400)
+
+        if path == "/api/links" and not self._writer():
+            return None
         if path == "/api/links":
             payload, err = self._body_json()
             if err:
@@ -430,6 +579,8 @@ class Handler(BaseHTTPRequestHandler):
             save_links(links)
             return self._send({"ok": True, "link": link}, 201)
 
+        if path == "/api/links/reorder" and not self._writer():
+            return None
         if path == "/api/links/reorder":
             payload, err = self._body_json()
             if err:
@@ -445,6 +596,8 @@ class Handler(BaseHTTPRequestHandler):
             save_links(links)
             return self._send({"ok": True})
 
+        if path == "/api/links/import" and not self._writer():
+            return None
         if path == "/api/links/import":
             payload, err = self._body_json()
             if err:
@@ -455,31 +608,76 @@ class Handler(BaseHTTPRequestHandler):
             if len(incoming) > 500:
                 return self._send({"error": "Too many links (max 500)"}, 400)
             links = []
+            used_ids = set()
             for item in incoming:
                 fields, err = validate(item)
                 if err:
                     return self._send({"error": "Row %d: %s" % (len(links) + 1, err)}, 400)
+                link_id = str(item.get("id", ""))
+                if not re.fullmatch(r"[a-f0-9]{12}", link_id) or link_id in used_ids:
+                    link_id = uuid.uuid4().hex[:12]
+                used_ids.add(link_id)
+                try:
+                    created_at = int(item.get("createdAt", 0)) or int(time.time())
+                except (TypeError, ValueError):
+                    created_at = int(time.time())
+                try:
+                    order = int(item.get("order", len(links)))
+                except (TypeError, ValueError):
+                    order = len(links)
                 links.append({
-                    "id": uuid.uuid4().hex[:12],
+                    "id": link_id,
                     "name": fields["name"], "url": fields["url"],
                     "category": fields["category"],
                     "description": fields.get("description", ""),
                     "pinned": fields.get("pinned", False),
                     "icon": fields.get("icon", "link"),
-                    "createdAt": int(time.time()),
-                    "order": len(links),
+                    "createdAt": created_at,
+                    "order": order,
                 })
             save_links(links)
             return self._send({"ok": True, "count": len(links)})
 
         return self._send({"error": "not found"}, 404)
 
+    def do_PUT(self):  # noqa: N802
+        path = self.path.split("?")[0]
+        user = self._admin()
+        if not user:
+            return None
+        if not self._same_origin():
+            return self._send({"error": "Cross-site writes are not allowed"}, 403)
+        if path != "/api/agent/config":
+            return self._send({"error": "not found"}, 404)
+        payload, err = self._body_json()
+        if err:
+            return self._send({"error": err}, 400)
+        try:
+            cfg = admin.save_agent_config(payload or {})
+        except (ValueError, PermissionError) as exc:
+            return self._send({"error": str(exc)}, 400)
+        return self._send(admin.public_config(cfg))
+
     def do_PATCH(self):  # noqa: N802
         path = self.path.split("?")[0]
+        if path.startswith("/api/users/"):
+            user = self._admin()
+            if not user:
+                return None
+            if not self._same_origin():
+                return self._send({"error": "Cross-site writes are not allowed"}, 403)
+            payload, err = self._body_json()
+            if err:
+                return self._send({"error": err}, 400)
+            try:
+                name = admin.update_user(unquote(path[len("/api/users/"):]), payload or {})
+            except (ValueError, PermissionError) as exc:
+                return self._send({"error": str(exc)}, 400)
+            return self._send({"ok": True, "username": name})
         if not path.startswith("/api/links/"):
             return self._send({"error": "not found"}, 404)
-        if not self._authed():
-            return self._send({"error": "Your session expired. Reload the page."}, 401)
+        if not self._writer():
+            return None
         if not self._same_origin():
             return self._send({"error": "Cross-site writes are not allowed"}, 403)
 
@@ -501,10 +699,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):  # noqa: N802
         path = self.path.split("?")[0]
+        if path.startswith("/api/users/"):
+            user = self._admin()
+            if not user:
+                return None
+            if not self._same_origin():
+                return self._send({"error": "Cross-site writes are not allowed"}, 403)
+            try:
+                name = admin.delete_user(unquote(path[len("/api/users/"):]))
+            except (ValueError, PermissionError) as exc:
+                return self._send({"error": str(exc)}, 400)
+            return self._send({"ok": True, "username": name})
         if not path.startswith("/api/links/"):
             return self._send({"error": "not found"}, 404)
-        if not self._authed():
-            return self._send({"error": "Your session expired. Reload the page."}, 401)
+        if not self._writer():
+            return None
         if not self._same_origin():
             return self._send({"error": "Cross-site writes are not allowed"}, 403)
 
@@ -522,6 +731,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ensure_dirs()
+    admin.seed_users()
     if not os.path.exists(LINKS_FILE):
         save_links(seed_links())
         print("seeded starter links", flush=True)

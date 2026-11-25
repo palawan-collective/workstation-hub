@@ -1,13 +1,17 @@
 # MerQato Workstation edge-routing example.
 #
-# This mirrors the live production topology as of 20 Nov 2026; it is a source
-# snapshot, not an instruction to change live routing. The Workstation app and
-# the legacy Homepage dashboard run on the same host. Keep the password prompt
-# on home.merqato.digital and leave Cloudflare Access in front of work.
+# This mirrors the live production topology as of 21 Nov 2026: one dashboard,
+# one URL. All dashboard traffic lands on https://work.merqato.digital behind
+# Cloudflare Access; home. and dash. are permanent redirects. The legacy
+# Homepage container (3003) is stopped and must not be re-enabled.
 
 home.merqato.digital {
+	redir https://work.merqato.digital{uri} permanent
+}
+
+work.merqato.digital {
 	basic_auth {
-		david <bcrypt-hash>
+		david@merqato.digital <bcrypt-hash>
 	}
 	handle_path /files/* {
 		reverse_proxy http://host.docker.internal:3004
@@ -19,17 +23,6 @@ home.merqato.digital {
 	encode gzip
 }
 
-work.merqato.digital {
-	handle_path /files/* {
-		reverse_proxy http://host.docker.internal:3004
-	}
-	handle_path /hub/* {
-		reverse_proxy http://host.docker.internal:3010
-	}
-	reverse_proxy http://host.docker.internal:3003
-	encode gzip
-}
-
 dash.merqato.digital {
-	redir https://home.merqato.digital{uri} permanent
+	redir https://work.merqato.digital{uri} permanent
 }

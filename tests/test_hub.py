@@ -202,3 +202,14 @@ class SecurityAndEnvironmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CleanTextTests(unittest.TestCase):
+    def test_html_and_oversized_values_are_rejected(self):
+        page = '<!DOCTYPE html><html><head><title>Sign in</title></head></html>'
+        self.assertEqual(hub.clean_text(page, 40), "")
+        self.assertEqual(hub.clean_text("x" * 200, 40), "")
+        self.assertEqual(hub.clean_text(None), "")
+        self.assertEqual(hub.clean_text({"a": 1}), "")
+
+    def test_plain_version_is_kept(self):
+        self.assertEqual(hub.clean_text(" 4.7.6\n", 40), "4.7.6")
